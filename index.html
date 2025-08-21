@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Windborne Flight Constellation — Challenge</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous">
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .panel {
+      position: absolute; top: 12px; left: 12px; z-index: 1000;
+      background: rgba(255,255,255,.95); padding: 12px 14px; border-radius: 12px;
+      box-shadow: 0 6px 18px rgba(0,0,0,.12); font: 14px/1.3 system-ui, Arial, sans-serif; max-width: 320px;
+    }
+    .panel h1 { margin: 0 0 6px; font-size: 16px; }
+    .panel button { cursor: pointer; border: 0; padding: 8px 10px; border-radius: 8px;
+      background: #111; color: #fff; font-weight: 600; }
+    .legend { font-size: 12px; opacity: .9; margin-top: 8px; }
+    .error { color: #b00020; font-weight: 600; }
+    .foot {
+      position: absolute; right: 12px; bottom: 12px; z-index: 1000;
+      background: rgba(255,255,255,.9); padding: 6px 8px; border-radius: 8px; font: 12px system-ui, Arial;
+    }
+    a { color: #0056cc; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <h1>Windborne Balloon Constellation</h1>
+    <div id="status">Loading latest 24h…</div>
+    <div class="legend">
+      • Circles = current balloon positions (click for weather)<br>
+      • Lines = last 24h tracks (skip gaps/corrupted points)<br>
+      • Auto-refresh every 5 min
+    </div>
+    <div style="margin-top:8px">
+      <button id="refreshBtn">Refresh now</button>
+    </div>
+  </div>
+  <div class="foot">
+    Built for the Flight Team Web Developer challenge. External dataset: Open-Meteo current weather.
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
+  <script>
+    // -------- CONFIG --------
+    const TREASURE_BASE = "https://a.windbornesystems.com/treasure";
+    const HOURS = 24;                    // 00..23
+    const REFRESH_MS = 5 * 60 * 1000;    // 5 minutes
+
+    // Map
+    const map = L.map('map').setView([20, 0], 2); // world view
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 8,
+      attribution: "&copy; OpenStreetMap"
+    }).addTo(map);
+
+    const layers = {
+      tracks: L.layerGroup().addTo(map),
+      markers: L.layerGroup().addTo(map)
+    };
+
+    const statusEl = document.getElementById('status');
+    document.getElementById('refreshBtn').addEventListener('click', () => bootstrap(true));
+
+    // ------------- Helpers -------------
+    const isNum = (n) => typeof n === "number" && isFinite(n);
+    function clampLatLon(lat, lon) {
+      if (!isNum(lat) || !isNum(lon)) return null;
+      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+      return [lat, lon];
+    }
+    function pick(obj, keys) {
+      for (const k of keys) if (obj && obj[k] != null) return obj[k];
+      return undefined;
+    }
+
+    // Guess fields from unknown schema.
+    function normalizeRecord(rec) {
+      // Try common keys
+      const lat = pick(rec, ["lat","latitude","Lat","Latitude"]);
+      const lon = pick(rec, ["lon","lng","longitude","Lon","Lng","Longitude"]);
+      const alt = pick(rec, ["alt","altitude","Altitude"]);
+      const id  = pick(rec, ["id","name","serial","balloon_id","balloon","call","callsign"]);
+      const t   = pick(rec, ["time","timestamp","t","date","ts"]);
+      const ok = clampLatLon(Number(lat), Number(lon));
+      if (!ok) return null;
+      return { id: id ?? "unknown", lat: ok[0], lon: ok[1], alt: isNum(Number(alt)) ? Number(alt) : null, time: t ?? null };
+    }
+
+    function normalizePayload(json) {
+      // Accept array or object map {id: {...}} or {records:[...]}
+      let arr = [];
+      if (Array.isArray(json)) arr = json;
+      else if (Array.isArray(json?.records)) arr = json.records;
+      else if (json && typeof json === "object") {
+        // Flatten values if object-of-objects
+        arr = Object.values(json);
+      }
+      const points = [];
+      for (const r of arr) {
+        const n = normalizeRecord(r);
+        if (n) points.push(n);
+      }
+      return points;
+    }
+
+    async function fetchHour(hour) {
+      const hh = String(hour).padStart(2,'0');
+      const url = `${TREASURE_BASE}/${hh}.json`;
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) throw new Error(`Fetch ${hh}.json failed: ${res.status}`);
+      const json = await res.json();
+      return normalizePayload(json);
+    }
+
+    // Weather: Open-Meteo current weather (no API key)
+    async function fetchWeather(lat, lon) {
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current_weather=true`;
+      try {
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) return null;
+        const j = await res.json();
+        return j.current_weather || null;
+      } catch {
+        return null;
+      }
+    }
+
+    function colorForId(id) {
+      // deterministic pastel-ish color per id
+      let h = 0;
+      for (let i=0;i<id.length;i++) h = (h*31 + id.charCodeAt(i)) % 360;
+      return `hsl(${h}, 75%, 45%)`;
+    }
+
+    function draw(tracksById, latestById) {
+      layers.tracks.clearLayers();
+      layers.markers.clearLayers();
+
+      const bounds = [];
+
+      // tracks
+      for (const [id, pts] of tracksById) {
+        const latlngs = pts.map(p => [p.lat, p.lon]);
+        if (latlngs.length >= 2) {
+          L.polyline(latlngs, { weight: 3, opacity: 0.7, color: colorForId(id) }).addTo(layers.tracks);
+          bounds.push(...latlngs);
+        }
+      }
+
+      // markers + weather
+      const markers = [];
+      for (const [id, p] of latestById) {
+        const m = L.circleMarker([p.lat, p.lon], {
+          radius: 6, weight: 2, color: "#111", fillOpacity: 0.9, fillColor: colorForId(id)
+        }).addTo(layers.markers);
+
+        (async () => {
+          const wx = await fetchWeather(p.lat, p.lon);
+          const wxHtml = wx
+            ? `<div><b>Weather</b>: ${wx.temperature}&deg;C, wind ${wx.windspeed} m/s @ ${wx.winddirection}&deg;</div>`
+            : `<div><i>Weather unavailable</i></div>`;
+          const altHtml = isNum(p.alt) ? `<div>Alt: ${p.alt} m</div>` : "";
+          const tHtml = p.time ? `<div>Time: ${p.time}</div>` : "";
+          m.bindPopup(`<b>Balloon:</b> ${id}${altHtml}${tHtml}${wxHtml}`);
+        })();
+
+        markers.push(m);
+        bounds.push([p.lat, p.lon]);
+      }
+
+      if (bounds.length) map.fitBounds(bounds, { padding: [30, 30] });
+    }
+
+    async function bootstrap(manual = false) {
+      statusEl.textContent = manual ? "Refreshing…" : "Loading latest 24h…";
+      try {
+        // Fetch hours 23 → 00 so tracks are time-ordered old→new
+        const hours = Array.from({length: HOURS}, (_,i)=>HOURS-1-i);
+        const results = await Promise.allSettled(hours.map(fetchHour));
+        const perHour = results.map(r => r.status === "fulfilled" ? r.value : []);
+
+        // Group by balloon id
+        const tracksById = new Map();
+        const latestById = new Map();
+
+        for (let h = 0; h < perHour.length; h++) {
+          for (const p of perHour[h]) {
+            const id = String(p.id ?? "unknown");
+            if (!tracksById.has(id)) tracksById.set(id, []);
+            tracksById.get(id).push(p);            // grows old→new via loop order
+            if (h === perHour.length - 1) latestById.set(id, p); // from 00.json
+          }
+        }
+
+        // If we failed to populate latest from 00.json, fall back to last non-empty hour
+        if (latestById.size === 0) {
+          for (let h = perHour.length - 1; h >= 0; h--) {
+            for (const p of perHour[h]) {
+              latestById.set(String(p.id ?? "unknown"), p);
+            }
+            if (latestById.size) break;
+          }
+        }
+
+        draw(tracksById, latestById);
+        statusEl.textContent = `Loaded ${latestById.size} balloons · tracks over last 24h`;
+      } catch (e) {
+        console.error(e);
+        statusEl.innerHTML = `<span class="error">Load failed.</span> See console for details.`;
+      }
+    }
+
+    bootstrap();
+    setInterval(bootstrap, REFRESH_MS);
+  </script>
+</body>
+</html>
