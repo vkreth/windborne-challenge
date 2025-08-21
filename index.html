@@ -49,7 +49,9 @@
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
   <script>
     // -------- CONFIG --------
-    const TREASURE_BASE = "https://a.windbornesystems.com/treasure";
+    // Use a public proxy to bypass CORS for the Windborne treasure endpoint
+    const PROXY = "https://corsproxy.io/?";
+    const TREASURE_HOST = "https://a.windbornesystems.com/treasure";
     const HOURS = 24;                    // 00..23
     const REFRESH_MS = 5 * 60 * 1000;    // 5 minutes
 
@@ -103,13 +105,23 @@
       return [];
     }
 
+    // Build proxied URL (with cache-buster)
+    function treasureUrl(hh) {
+      return `${PROXY}${TREASURE_HOST}/${hh}.json?t=${Date.now()}`;
+    }
+
     async function fetchHour(hour) {
       const hh = String(hour).padStart(2,'0');
-      const url = `${TREASURE_BASE}/${hh}.json`;
-      const res = await fetch(url, { cache: "no-store" });
-      if (!res.ok) throw new Error(`Fetch ${hh}.json failed: ${res.status}`);
-      const json = await res.json();
-      return normalizePayload(json);
+      const url = treasureUrl(hh);
+      try {
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) throw new Error(`Fetch ${hh}.json failed: ${res.status}`);
+        const json = await res.json();
+        return normalizePayload(json);
+      } catch (e) {
+        console.error('Treasure fetch error', hh, e);
+        return [];
+      }
     }
 
     // Weather: Open-Meteo current weather (no API key)
